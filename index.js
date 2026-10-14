@@ -888,101 +888,152 @@ function buildOfficialNoticePdfBuffer(title, message, recipientName, dateStr) {
     });
 }
 
-// 🎙️ सुरक्षित एवं क्रैश-प्रूफ Swara Neural AI वॉइस जनरेटर
-async function generateHindiVoiceNote(text) {
-    const stamp = Date.now() + '_' + Math.floor(Math.random() * 100000);
-    const mp3Path = path.join(os.tmpdir(), `voice_${stamp}.mp3`);
-    const oggPath = path.join(os.tmpdir(), `voice_${stamp}.ogg`);
+// 🎙️ VOICE ENGINE: Edge (universal) -> Edge (msedge-tts) -> Google (chunked)
+function cleanTtsText(text) {
+    return String(text || '')
+        .replace(/[*_~`#>]/g, '')
+        .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
+        .replace(/[<&]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
 
-    const cleanup = () => {
-        try { if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path); } catch (e) {}
-        try { if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath); } catch (e) {}
-    };
+function splitForGoogle(text, maxLen = 180) {
+    const parts = text.split(/(?<=[।.!?,])\s+/);
+    const chunks = [];
+    let cur = '';
+    for (const p of parts) {
+        if ((cur + ' ' + p).trim().length <= maxLen) {
+            cur = (cur + ' ' + p).trim();
+        } else {
+            if (cur) chunks.push(cur);
+            if (p.length <= maxLen) {
+                cur = p;
+            } else {
+                let tmp = '';
+                for (const w of p.split(' ')) {
+                    if ((tmp + ' ' + w).trim().length <= maxLen) tmp = (tmp + ' ' + w).trim();
+                    else { if (tmp) chunks.push(tmp); tmp = w; }
+                }
+                cur = tmp;
+            }
+        }
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+}
 
-    try {
-        const tts = new MsEdgeTTS();
-        await tts.setMetadata(HINDI_FEMALE_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-        const { audioStream } = await tts.toStream(text);
+async function ttsEdgeUniversal(text) {
+    const { EdgeTTS } = await import('edge-tts-universal');
+    const tts = new EdgeTTS(text, HINDI_FEMALE_VOICE);
+    const result = await tts.synthesize();
+    return Buffer.from(await result.audio.arrayBuffer());
+}
 
-        const chunks = [];
-        await new Promise((resolve, reject) => {
-            audioStream.on('data', (chunk) => chunks.push(chunk));
-            audioStream.on('end', resolve);
-            audioStream.on('error', reject);
+async function ttsMsEdge(text) {
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(HINDI_FEMALE_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    const res = await tts.toStream(text);
+    const stream = (res && res.audioStream) ? res.audioStream : res;
+    const chunks = [];
+    await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('TTS timeout 25s')), 25000);
+        stream.on('data', c => chunks.push(Buffer.from(c)));
+        stream.on('end', () => { clearTimeout(t); resolve(); });
+        stream.on('close', () => { clearTimeout(t); resolve(); });
+        stream.on('error', e => { clearTimeout(t); reject(e); });
+    });
+    return Buffer.concat(chunks);
+}
+
+async function ttsGoogleChunked(text) {
+    const pieces = splitForGoogle(text);
+    const bufs = [];
+    for (const piece of pieces) {
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(piece)}&tl=hi&client=tw-ob`;
+        const r = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 12000,
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
+        bufs.push(Buffer.from(r.data));
+    }
+    return Buffer.concat(bufs);
+}
 
-        fs.writeFileSync(mp3Path, Buffer.concat(chunks));
-
-        return await new Promise((resolve) => {
+function mp3ToOpusBuffer(mp3Buffer) {
+    return new Promise((resolve) => {
+        const stamp = Date.now() + '_' + Math.floor(Math.random() * 100000);
+        const mp3Path = path.join(os.tmpdir(), `voice_${stamp}.mp3`);
+        const oggPath = path.join(os.tmpdir(), `voice_${stamp}.ogg`);
+        const cleanup = () => {
+            try { if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path); } catch (e) {}
+            try { if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath); } catch (e) {}
+        };
+        try {
+            fs.writeFileSync(mp3Path, mp3Buffer);
             ffmpeg(mp3Path)
+                .noVideo()
                 .audioCodec('libopus')
-                .audioBitrate('32k')
                 .audioChannels(1)
+                .audioFrequency(48000)
+                .audioBitrate('32k')
                 .format('ogg')
                 .on('end', () => {
                     try {
-                        const buffer = fs.readFileSync(oggPath);
+                        const out = fs.readFileSync(oggPath);
                         cleanup();
-                        resolve(buffer);
-                    } catch (readErr) {
+                        resolve(out);
+                    } catch (e) {
+                        console.error('❌ OGG पढ़ने में विफलता:', e.message);
                         cleanup();
                         resolve(null);
                     }
                 })
-                .on('error', () => {
+                .on('error', (e) => {
+                    console.error('❌ FFmpeg एन्कोडिंग विफल:', e.message);
                     cleanup();
                     resolve(null);
                 })
                 .save(oggPath);
-        });
-    } catch (err) {
-        console.error('⚠️ Edge TTS असफल, फॉलबैक का उपयोग हो रहा है:', err.message);
-        try {
-            const encodedText = encodeURIComponent(text);
-            const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodedText}&tl=hi&client=tw-ob`;
-
-            const response = await axios({
-                method: 'get',
-                url: ttsUrl,
-                responseType: 'stream',
-                headers: { 'User-Agent': 'Mozilla/5.0' }
-            });
-
-            const writer = fs.createWriteStream(mp3Path);
-            response.data.pipe(writer);
-
-            await new Promise((resolve, reject) => {
-                writer.on('finish', resolve);
-                writer.on('error', reject);
-            });
-
-            return await new Promise((resolve) => {
-                ffmpeg(mp3Path)
-                    .audioCodec('libopus')
-                    .audioBitrate('32k')
-                    .audioChannels(1)
-                    .format('ogg')
-                    .on('end', () => {
-                        try {
-                            const buffer = fs.readFileSync(oggPath);
-                            cleanup();
-                            resolve(buffer);
-                        } catch (e) {
-                            cleanup();
-                            resolve(null);
-                        }
-                    })
-                    .on('error', () => {
-                        cleanup();
-                        resolve(null);
-                    })
-                    .save(oggPath);
-            });
-        } catch (fallbackErr) {
+        } catch (e) {
+            console.error('❌ mp3ToOpusBuffer त्रुटि:', e.message);
             cleanup();
-            return null;
+            resolve(null);
+        }
+    });
+}
+
+async function generateHindiVoiceNote(text) {
+    const clean = cleanTtsText(text);
+    if (!clean) {
+        console.log('⚠️ वॉइस जनरेशन निरस्त: टेक्स्ट खाली है।');
+        return null;
+    }
+
+    const engines = [
+        { name: 'Edge-Universal', fn: ttsEdgeUniversal },
+        { name: 'MsEdge-TTS', fn: ttsMsEdge },
+        { name: 'Google-TTS', fn: ttsGoogleChunked }
+    ];
+
+    for (const eng of engines) {
+        try {
+            const mp3 = await eng.fn(clean);
+            if (!mp3 || mp3.length < 1000) throw new Error(`audio छोटा/खाली (${mp3 ? mp3.length : 0} bytes)`);
+            console.log(`🎙️ ${eng.name} से MP3 तैयार: ${mp3.length} bytes`);
+            const ogg = await mp3ToOpusBuffer(mp3);
+            if (ogg) {
+                console.log(`✅ OGG तैयार (${eng.name}): ${ogg.length} bytes`);
+                return ogg;
+            }
+        } catch (e) {
+            console.error(`⚠️ ${eng.name} विफल:`, e.message);
         }
     }
+
+    console.error('❌ सभी वॉइस इंजन विफल रहे।');
+    return null;
 }
 
 // 🛡️ सुरक्षित और क्रैश-प्रूफ ऑटो-मैसेज प्रोसेसिंग क्यू
